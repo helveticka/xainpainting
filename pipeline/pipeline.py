@@ -1,105 +1,113 @@
 """
-Pipeline piloto: SAM 2 + Replicate Inpainting
+Pipeline de generación de pares contrafactuales fotorrealistas
 TFG - Explainabilidad XAI con dataset fotorrealista
+Universitat de les Illes Balears
 
 Flujo:
   1. Descarga imágenes de COCO con coches (con bounding boxes anotados)
   2. SAM 2 genera una máscara precisa del coche usando el bbox como guía
-  3. Replicate API hace inpainting de la región enmascarada
+  3. Inpainting de la región enmascarada (Replicate API o LaMa local)
   4. Se calculan las métricas PCP, MAPD y SSIM para cada par
   5. Se guardan los pares validados en output/
 
-Requisitos:
-  pip install replicate pycocotools Pillow numpy scikit-image requests torch torchvision
-
-SAM 2 (instalar una sola vez):
-  pip install git+https://github.com/facebookresearch/sam2.git
-  # Descargar checkpoint:
-  mkdir -p checkpoints
-  wget -P checkpoints https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
+Entornos:
+  - xai_env  (conda, Python 3.10): SAM 2 + Replicate + métricas
+  - lama_env (conda, Python 3.9):  LaMa con refinamiento
 
 Uso:
-  export REPLICATE_API_TOKEN=r8_F6hsd7IgL1p0W1k3XR5lRQc26HOXK5J33hlm0
-  python pipeline_pilot.py
+  # Con Replicate (ejecutar desde xai_env):
+  export REPLICATE_API_TOKEN=tu_token
+  python pipeline/pipeline.py --inpainting replicate
+
+  # Con LaMa local (ejecutar desde xai_env, requiere lama_env instalado):
+  python pipeline/pipeline.py --inpainting lama
+
+Setup inicial (una sola vez):
+  # Checkpoint SAM 2:
+  mkdir -p checkpoints
+  curl -L -o checkpoints/sam2.1_hiera_small.pt \\
+    https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
+
+  # Checkpoint LaMa (dentro de models/lama/):
+  cd models/lama
+  curl -L "https://huggingface.co/smartywu/big-lama/resolve/main/big-lama.zip" -o big-lama.zip
+  unzip big-lama.zip && rm big-lama.zip
+
+  # Anotaciones COCO (una sola vez):
+  curl -O http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+  unzip annotations_trainval2017.zip annotations/instances_val2017.json
+  mv annotations/instances_val2017.json instances_val2017.json
 """
 
 import os
 import io
+import sys
 import json
 import time
 import base64
+import argparse
+import tempfile
+import subprocess
 import requests
 import numpy as np
 from pathlib import Path
 from PIL import Image
-from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import structural_similarity as ssim_metric
 
 import torch
-import replicate
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 
-COCO_IMAGES_DIR   = Path("coco_images")       # donde se guardan las imágenes descargadas
-OUTPUT_DIR        = Path("output")             # pares generados
-METRICS_FILE      = OUTPUT_DIR / "metrics.json"
+PROJECT_ROOT    = Path(__file__).parent.parent
+COCO_IMAGES_DIR = PROJECT_ROOT / "data" / "coco_images"
+ANN_PATH        = PROJECT_ROOT / "data" / "instances_val2017.json"
+OUTPUT_DIR      = PROJECT_ROOT / "output"
+METRICS_FILE    = OUTPUT_DIR / "metrics.json"
 
-N_IMAGES          = 15    # imágenes del piloto (empieza con 15, suficiente para validar)
-MIN_CAR_AREA      = 8000  # píxeles mínimos del bbox del coche (evita coches muy pequeños)
+SAM2_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "sam2.1_hiera_small.pt"
+SAM2_CONFIG     = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
-# Umbrales de aceptación del par (basados en los resultados del informe como baseline)
-SSIM_MIN          = 0.92  # por encima de esto, el fondo se preserva bien
-PCP_MAX           = 25.0  # % máximo de píxeles modificados fuera de la máscara
-MAPD_MAX          = 8.0   # diferencia absoluta media máxima aceptable
+LAMA_DIR        = PROJECT_ROOT / "models" / "lama"
+LAMA_MODEL      = LAMA_DIR / "big-lama"
+LAMA_PYTHON     = Path(os.environ.get(
+    "LAMA_PYTHON",
+    # ruta por defecto al Python del entorno lama_env
+    Path.home() / "miniconda3" / "envs" / "lama_env" / "bin" / "python3"
+))
 
-# Modelo de inpainting en Replicate
-INPAINTING_MODEL = "bria/eraser"
-# ─── PASO 1: DESCARGA DE IMÁGENES COCO CON COCHES ─────────────────────────────
+N_IMAGES        = 15     # imágenes a procesar
+MIN_CAR_AREA    = 8000   # área mínima del bbox del coche en píxeles
+MASK_MAX_PCT    = 20.0   # % máximo de la imagen que puede cubrir la máscara
+
+# Umbrales de validación del par
+SSIM_MIN        = 0.92
+PCP_EXT_MAX     = 25.0
+MAPD_EXT_MAX    = 8.0
+
+# Modelo Replicate
+REPLICATE_MODEL = "bria/eraser"
+
+
+# ─── PASO 1: DESCARGA DE IMÁGENES COCO ────────────────────────────────────────
 
 def download_coco_car_images(n: int, output_dir: Path) -> list[dict]:
     """
-    Descarga n imágenes de COCO que contengan coches usando la API pública.
-    Devuelve lista de dicts con {image_path, bboxes}.
-    No requiere descargar el dataset completo.
+    Descarga n imágenes de COCO que contengan coches.
+    Usa las anotaciones de instances_val2017.json (debe existir en data/).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Obteniendo anotaciones de COCO...")
-    # API pública de COCO: categoría 3 = car
-    ann_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-    
-    # Usamos la API REST de COCO para no descargar todo el zip
-    # Alternativa ligera: endpoint de instancias
-    instances_url = "https://raw.githubusercontent.com/nightrome/cocostuff/master/dataset/annotations/instances_val2017.json"
-    
-    # Descargamos solo el JSON de validación (más pequeño que el de train)
-    ann_path = Path("instances_val2017.json")
-    if not ann_path.exists():
-        print("Descargando anotaciones de COCO val2017 (~25MB)...")
-        r = requests.get(
-            "http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
-            stream=True
-        )
-        # Más sencillo: descargar directamente el JSON de instancias
-        r2 = requests.get(
-            "https://storage.googleapis.com/tfds-data/downloads/manual/coco2017/annotations/instances_val2017.json",
-            timeout=30
-        )
-        if r2.status_code != 200:
-            # Fallback: usar pycocotools con descarga manual
-            print("Descargando instancias val2017 directamente...")
-            r3 = requests.get(
-                "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-            )
-            # Guardamos instrucción para descarga manual
-            print("\n[INFO] Descarga automática bloqueada por COCO. Ejecuta manualmente:")
-            print("  cd coco_images && wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip")
-            print("  unzip annotations_trainval2017.zip")
-            return []
+    if not ANN_PATH.exists():
+        print(f"[ERROR] No se encontraron anotaciones en {ANN_PATH}")
+        print("Descárgalas con:")
+        print("  curl -O http://images.cocodataset.org/annotations/annotations_trainval2017.zip")
+        print("  unzip annotations_trainval2017.zip annotations/instances_val2017.json")
+        print(f"  mv annotations/instances_val2017.json {ANN_PATH}")
+        return []
 
     from pycocotools.coco import COCO
-    coco = COCO(str(ann_path))
-
-    # ID de la categoría "car" en COCO
+    print("Cargando anotaciones COCO...")
+    coco    = COCO(str(ANN_PATH))
     cat_ids = coco.getCatIds(catNms=["car"])
     img_ids = coco.getImgIds(catIds=cat_ids)
 
@@ -112,7 +120,6 @@ def download_coco_car_images(n: int, output_dir: Path) -> list[dict]:
         ann_ids  = coco.getAnnIds(imgIds=img_id, catIds=cat_ids, iscrowd=False)
         anns     = coco.loadAnns(ann_ids)
 
-        # Filtrar coches con área suficiente
         valid_bboxes = [
             ann["bbox"] for ann in anns
             if ann["bbox"][2] * ann["bbox"][3] >= MIN_CAR_AREA
@@ -120,19 +127,17 @@ def download_coco_car_images(n: int, output_dir: Path) -> list[dict]:
         if not valid_bboxes:
             continue
 
-        # Descargar la imagen
         img_path = output_dir / img_info["file_name"]
         if not img_path.exists():
-            img_url = img_info["coco_url"]
-            r = requests.get(img_url, timeout=15)
+            r = requests.get(img_info["coco_url"], timeout=15)
             if r.status_code != 200:
                 continue
             img_path.write_bytes(r.content)
 
         collected.append({
             "image_path": str(img_path),
-            "image_id": img_id,
-            "bboxes": valid_bboxes  # formato COCO: [x, y, width, height]
+            "image_id":   img_id,
+            "bboxes":     valid_bboxes,
         })
         print(f"  [{len(collected)}/{n}] {img_info['file_name']}")
 
@@ -142,147 +147,180 @@ def download_coco_car_images(n: int, output_dir: Path) -> list[dict]:
 # ─── PASO 2: SEGMENTACIÓN CON SAM 2 ───────────────────────────────────────────
 
 def load_sam2():
-    """Carga el modelo SAM 2 small (más ligero, suficiente para el piloto)."""
+    """Carga SAM 2 small. Requiere xai_env."""
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    checkpoint = "checkpoints/sam2.1_hiera_small.pt"
-    config     = "configs/sam2.1/sam2.1_hiera_s.yaml"
-
-    if not Path(checkpoint).exists():
+    if not SAM2_CHECKPOINT.exists():
         raise FileNotFoundError(
-            f"Checkpoint de SAM 2 no encontrado en {checkpoint}.\n"
+            f"Checkpoint SAM 2 no encontrado en {SAM2_CHECKPOINT}\n"
             "Descárgalo con:\n"
-            "  mkdir -p checkpoints\n"
-            "  wget -P checkpoints https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt"
+            f"  curl -L -o {SAM2_CHECKPOINT} "
+            "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt"
         )
 
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"SAM 2 usando dispositivo: {device}")
-
-    model     = build_sam2(config, checkpoint, device=device)
+    device    = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"SAM 2 dispositivo: {device}")
+    model     = build_sam2(SAM2_CONFIG, str(SAM2_CHECKPOINT), device=device)
     predictor = SAM2ImagePredictor(model)
     return predictor
 
 
 def generate_mask_sam2(predictor, image: np.ndarray, bbox_coco: list) -> np.ndarray:
     """
-    Genera máscara binaria del objeto dado un bounding box en formato COCO [x,y,w,h].
+    Genera máscara binaria del objeto dado bbox en formato COCO [x,y,w,h].
     Devuelve máscara booleana (H, W).
     """
-    # Convertir bbox COCO [x, y, w, h] → [x1, y1, x2, y2] que espera SAM
-    x, y, w, h = bbox_coco
-    box_xyxy = np.array([x, y, x + w, y + h])
-
+    x, y, w, h  = bbox_coco
+    box_xyxy     = np.array([x, y, x + w, y + h])
     predictor.set_image(image)
     masks, scores, _ = predictor.predict(
-        box=box_xyxy[None, :],   # SAM espera (1, 4)
+        box=box_xyxy[None, :],
         multimask_output=True
     )
-
-    # Tomar la máscara con mayor score
-    best_idx = np.argmax(scores)
-    mask = masks[best_idx]  # bool (H, W)
-    return mask
+    return masks[np.argmax(scores)]
 
 
-# ─── PASO 3: INPAINTING CON REPLICATE ─────────────────────────────────────────
+# ─── PASO 3A: INPAINTING CON REPLICATE ────────────────────────────────────────
 
-def mask_to_base64_png(mask: np.ndarray) -> str:
-    """Convierte máscara booleana a PNG en base64 (blanco = rellenar)."""
-    mask_uint8 = (mask * 255).astype(np.uint8)
-    pil_mask   = Image.fromarray(mask_uint8).convert("RGB")
-    buf        = io.BytesIO()
-    pil_mask.save(buf, format="PNG")
+def _to_base64_png(arr: np.ndarray) -> str:
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def image_to_base64_png(image: np.ndarray) -> str:
-    """Convierte imagen numpy RGB a PNG en base64."""
-    pil_img = Image.fromarray(image)
-    buf     = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-def run_inpainting(image: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
-    """
-    Llama a Replicate para hacer inpainting de la región enmascarada.
-    Devuelve imagen resultado como numpy array RGB, o None si falla.
-    """
-    img_b64  = image_to_base64_png(image)
-    mask_b64 = mask_to_base64_png(mask)
+def run_inpainting_replicate(image: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """Inpainting via Replicate API (bria/eraser). Requiere REPLICATE_API_TOKEN."""
+    import replicate
 
     try:
+        img_b64  = _to_base64_png(image)
+        mask_b64 = _to_base64_png((mask * 255).astype(np.uint8))
+
         output = replicate.run(
-        INPAINTING_MODEL,
-        input={
-            "image": f"data:image/png;base64,{img_b64}",
-            "mask":  f"data:image/png;base64,{mask_b64}",
-        }
+            REPLICATE_MODEL,
+            input={
+                "image": f"data:image/png;base64,{img_b64}",
+                "mask":  f"data:image/png;base64,{mask_b64}",
+            }
         )
 
-        # output es una URL con la imagen resultado
         result_url = output[0] if isinstance(output, list) else output
-        r = requests.get(result_url, timeout=30)
-        result_img = np.array(Image.open(io.BytesIO(r.content)).convert("RGB"))
-        return result_img
+        r          = requests.get(str(result_url), timeout=30)
+        return np.array(Image.open(io.BytesIO(r.content)).convert("RGB"))
 
     except Exception as e:
-        print(f"  [ERROR] Inpainting fallido: {e}")
+        print(f"  [ERROR] Replicate falló: {e}")
         return None
+
+
+# ─── PASO 3B: INPAINTING CON LAMA (subproceso) ────────────────────────────────
+
+def run_inpainting_lama(image: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """
+    Inpainting con LaMa ejecutado como subproceso en lama_env.
+    Usa archivos temporales para comunicar imagen y máscara.
+    No requiere importar dependencias de LaMa en xai_env.
+    """
+    if not LAMA_PYTHON.exists():
+        print(f"  [ERROR] Python de lama_env no encontrado en {LAMA_PYTHON}")
+        print("  Ajusta la variable LAMA_PYTHON o el path en la configuración.")
+        return None
+
+    if not LAMA_MODEL.exists():
+        print(f"  [ERROR] Checkpoint LaMa no encontrado en {LAMA_MODEL}")
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # Guardar inputs
+        img_path  = tmpdir / "image.png"
+        mask_path = tmpdir / "image_mask001.png"
+        Image.fromarray(image).save(img_path)
+        Image.fromarray((mask * 255).astype(np.uint8)).save(mask_path)
+
+        # Ejecutar LaMa
+        cmd = [
+            str(LAMA_PYTHON),
+            str(LAMA_DIR / "bin" / "predict.py"),
+            f"model.path={LAMA_MODEL}",
+            f"indir={tmpdir}",
+            f"outdir={tmpdir}/output",
+            "model.checkpoint=best.ckpt",
+        ]
+
+        env = os.environ.copy()
+        env["TORCH_HOME"]  = str(LAMA_DIR)
+        env["PYTHONPATH"]  = str(LAMA_DIR)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(LAMA_DIR)
+        )
+
+        if result.returncode != 0:
+            print(f"  [ERROR] LaMa falló:\n{result.stderr[-500:]}")
+            return None
+
+        # Leer resultado
+        output_dir_path = tmpdir / "output"
+        if output_dir_path.exists():
+            files = list(output_dir_path.iterdir())
+            print(f"  [DEBUG] Archivos en output: {[f.name for f in files]}")
+        else:
+            print("  [DEBUG] El directorio output no existe")
+            return None
+
+        output_path = tmpdir / "output" / "image_mask001.png"
+        if not output_path.exists():
+            print("  [ERROR] LaMa no generó output")
+            return None
+
+        return np.array(Image.open(output_path).convert("RGB"))
 
 
 # ─── PASO 4: MÉTRICAS ─────────────────────────────────────────────────────────
 
 def compute_metrics(original: np.ndarray, modified: np.ndarray, mask: np.ndarray) -> dict:
     """
-    Calcula PCP, MAPD y SSIM entre imagen original y modificada.
-    También calcula métricas solo en la región exterior a la máscara
-    para verificar que el fondo no ha cambiado.
+    Calcula PCP, MAPD y SSIM globales y en la región exterior a la máscara.
+    Las métricas exteriores miden cuánto cambió el fondo (idealmente 0).
     """
-    orig_f   = original.astype(np.float32)
-    mod_f    = modified.astype(np.float32)
-    diff     = np.abs(orig_f - mod_f).mean(axis=2)  # (H, W) diferencia por canal promediada
+    orig_f = original.astype(np.float32)
+    mod_f  = modified.astype(np.float32)
+    diff   = np.abs(orig_f - mod_f).mean(axis=2)
 
-    # Métricas globales (igual que en el informe)
-    threshold      = 5.0
-    pcp_global     = float((diff > threshold).mean() * 100)
-    mapd_global    = float(diff.mean())
+    threshold  = 5.0
+    pcp_global = float((diff > threshold).mean() * 100)
+    mapd_global = float(diff.mean())
+    ssim_global = float(ssim_metric(original, modified, channel_axis=2, data_range=255))
 
-    # SSIM global
-    ssim_global = float(ssim(
-        original, modified,
-        channel_axis=2,
-        data_range=255
-    ))
-
-    # Métricas en la región EXTERIOR a la máscara (el fondo)
-    # Esto es lo clave: idealmente el fondo no debería cambiar nada
     exterior = mask == 0
     if exterior.sum() > 0:
         diff_ext   = diff[exterior]
         pcp_ext    = float((diff_ext > threshold).mean() * 100)
         mapd_ext   = float(diff_ext.mean())
     else:
-        pcp_ext  = 0.0
-        mapd_ext = 0.0
+        pcp_ext = mapd_ext = 0.0
 
     return {
-        "pcp_global":  round(pcp_global,  4),
-        "mapd_global": round(mapd_global, 4),
-        "ssim_global": round(ssim_global, 4),
-        "pcp_exterior":  round(pcp_ext,  4),  # cuánto cambió el fondo (debería ser ~0)
-        "mapd_exterior": round(mapd_ext, 4),
+        "pcp_global":    round(pcp_global,  4),
+        "mapd_global":   round(mapd_global, 4),
+        "ssim_global":   round(ssim_global, 4),
+        "pcp_exterior":  round(pcp_ext,     4),
+        "mapd_exterior": round(mapd_ext,    4),
     }
 
 
 def validate_pair(metrics: dict) -> bool:
-    """Devuelve True si el par supera los umbrales de calidad."""
     return (
-        metrics["ssim_global"]  >= SSIM_MIN and
-        metrics["pcp_exterior"] <= PCP_MAX  and
-        metrics["mapd_exterior"] <= MAPD_MAX
+        metrics["ssim_global"]   >= SSIM_MIN     and
+        metrics["pcp_exterior"]  <= PCP_EXT_MAX  and
+        metrics["mapd_exterior"] <= MAPD_EXT_MAX
     )
 
 
@@ -290,7 +328,6 @@ def validate_pair(metrics: dict) -> bool:
 
 def save_pair(original: np.ndarray, modified: np.ndarray, mask: np.ndarray,
               metrics: dict, image_id: int, pair_idx: int):
-    """Guarda el par original/modificado y la máscara con sus métricas."""
     pair_dir = OUTPUT_DIR / f"pair_{pair_idx:03d}"
     pair_dir.mkdir(parents=True, exist_ok=True)
 
@@ -302,24 +339,36 @@ def save_pair(original: np.ndarray, modified: np.ndarray, mask: np.ndarray,
     (pair_dir / "metrics.json").write_text(json.dumps(meta, indent=2))
 
     print(f"  Guardado en {pair_dir}/")
-    print(f"  PCP global: {metrics['pcp_global']:.2f}%  |  "
-          f"MAPD global: {metrics['mapd_global']:.2f}  |  "
-          f"SSIM: {metrics['ssim_global']:.4f}")
-    print(f"  PCP exterior (fondo): {metrics['pcp_exterior']:.2f}%  |  "
-          f"MAPD exterior: {metrics['mapd_exterior']:.2f}")
+    print(f"  SSIM: {metrics['ssim_global']:.4f}  |  "
+          f"PCP global: {metrics['pcp_global']:.1f}%  |  "
+          f"PCP exterior: {metrics['pcp_exterior']:.1f}%")
 
 
 # ─── PIPELINE PRINCIPAL ───────────────────────────────────────────────────────
 
-def run_pipeline():
+def run_pipeline(backend: str):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Validar backend
+    if backend == "replicate":
+        if not os.environ.get("REPLICATE_API_TOKEN"):
+            print("[ERROR] Falta REPLICATE_API_TOKEN.")
+            print("Ejecuta: export REPLICATE_API_TOKEN=tu_token")
+            sys.exit(1)
+        run_inpainting = run_inpainting_replicate
+        print(f"Backend: Replicate ({REPLICATE_MODEL})")
+    elif backend == "lama":
+        run_inpainting = run_inpainting_lama
+        print(f"Backend: LaMa local ({LAMA_MODEL})")
+    else:
+        print(f"[ERROR] Backend desconocido: {backend}. Usa 'replicate' o 'lama'.")
+        sys.exit(1)
 
     # 1. Descargar imágenes
     print("\n=== PASO 1: Descargando imágenes de COCO ===")
     image_records = download_coco_car_images(N_IMAGES, COCO_IMAGES_DIR)
-
     if not image_records:
-        print("[STOP] No se pudieron obtener imágenes. Revisa la descarga manual de anotaciones.")
+        print("[STOP] No se pudieron obtener imágenes.")
         return
 
     # 2. Cargar SAM 2
@@ -332,16 +381,12 @@ def run_pipeline():
     for record in image_records:
         img_path = record["image_path"]
         bboxes   = record["bboxes"]
-
         print(f"\n--- Procesando: {Path(img_path).name} ---")
 
-        image_pil = Image.open(img_path).convert("RGB")
-        image_np  = np.array(image_pil)
+        image_np = np.array(Image.open(img_path).convert("RGB"))
+        bbox     = max(bboxes, key=lambda b: b[2] * b[3])
 
-        # Procesar el coche más grande de la imagen (bbox con mayor área)
-        bbox = max(bboxes, key=lambda b: b[2] * b[3])
-
-        # 3. Segmentación con SAM 2
+        # 3. Segmentación
         print("  Generando máscara SAM 2...")
         try:
             mask = generate_mask_sam2(predictor, image_np, bbox)
@@ -349,22 +394,20 @@ def run_pipeline():
             print(f"  [ERROR] SAM 2 falló: {e}")
             continue
 
-        mask_coverage = mask.mean() * 100
-        print(f"  Máscara generada: {mask_coverage:.1f}% de la imagen cubierta")
+        mask_pct = mask.mean() * 100
+        print(f"  Máscara: {mask_pct:.1f}% de la imagen")
 
-        # Sanity check: la máscara no debe cubrir más del 40% de la imagen
-        if mask_coverage > 40:
-            print("  [SKIP] Máscara demasiado grande, posible error de segmentación")
+        if mask_pct > MASK_MAX_PCT:
+            print(f"  [SKIP] Máscara demasiado grande (>{MASK_MAX_PCT}%)")
             continue
 
-        # 4. Inpainting con Replicate
-        print("  Llamando a Replicate inpainting...")
+        # 4. Inpainting
+        print(f"  Inpainting con {backend}...")
         inpainted = run_inpainting(image_np, mask)
-
         if inpainted is None:
             continue
 
-        # Asegurarse de que las dimensiones coinciden
+        # Ajustar dimensiones si es necesario
         if inpainted.shape != image_np.shape:
             inpainted = np.array(
                 Image.fromarray(inpainted).resize(
@@ -373,17 +416,16 @@ def run_pipeline():
                 )
             )
 
-        # 5. Métricas
+        # 5. Métricas y validación
         metrics = compute_metrics(image_np, inpainted, mask)
         valid   = validate_pair(metrics)
-
-        status = "✓ VÁLIDO" if valid else "✗ DESCARTADO"
-        print(f"  {status}")
+        print(f"  {'✓ VÁLIDO' if valid else '✗ DESCARTADO'}")
 
         all_metrics.append({
-            "image": img_path,
+            "image":    img_path,
+            "backend":  backend,
             "pair_idx": pair_idx if valid else None,
-            "valid": valid,
+            "valid":    valid,
             **metrics
         })
 
@@ -391,36 +433,48 @@ def run_pipeline():
             save_pair(image_np, inpainted, mask, metrics, record["image_id"], pair_idx)
             pair_idx += 1
 
-        time.sleep(12)  # respetar rate limit de Replicate
+        if backend == "replicate":
+            time.sleep(12)  # respetar rate limit
 
-    # 6. Resumen final
-    print("\n=== RESUMEN DEL PILOTO ===")
+    # 6. Resumen
+    print("\n=== RESUMEN ===")
     valid_pairs = [m for m in all_metrics if m["valid"]]
-    print(f"Pares generados:  {len(image_records)}")
-    print(f"Pares válidos:    {len(valid_pairs)}")
-    print(f"Pares descartados: {len(image_records) - len(valid_pairs)}")
+    print(f"Procesadas:  {len(image_records)}")
+    print(f"Válidas:     {len(valid_pairs)}")
+    print(f"Descartadas: {len(image_records) - len(valid_pairs)}")
 
     if valid_pairs:
-        avg_ssim  = np.mean([m["ssim_global"]    for m in valid_pairs])
-        avg_pcp   = np.mean([m["pcp_global"]      for m in valid_pairs])
-        avg_mapd  = np.mean([m["mapd_global"]     for m in valid_pairs])
-        avg_pcp_e = np.mean([m["pcp_exterior"]    for m in valid_pairs])
         print(f"\nMétricas medias (pares válidos):")
-        print(f"  SSIM global:        {avg_ssim:.4f}   (baseline informe: 0.8011)")
-        print(f"  PCP global:         {avg_pcp:.2f}%  (baseline informe: 98.1%)")
-        print(f"  MAPD global:        {avg_mapd:.2f}   (baseline informe: 14.31)")
-        print(f"  PCP exterior fondo: {avg_pcp_e:.2f}%  (ideal: ~0%)")
+        for key in ["ssim_global", "pcp_global", "mapd_global", "pcp_exterior", "mapd_exterior"]:
+            avg = np.mean([m[key] for m in valid_pairs])
+            print(f"  {key}: {avg:.4f}")
 
-    # Guardar métricas completas
     METRICS_FILE.write_text(json.dumps(all_metrics, indent=2))
     print(f"\nMétricas guardadas en {METRICS_FILE}")
 
 
-if __name__ == "__main__":
-    token = os.environ.get("REPLICATE_API_TOKEN")
-    if not token:
-        print("[ERROR] Falta REPLICATE_API_TOKEN.")
-        print("Ejecuta: export REPLICATE_API_TOKEN=tu_token_aqui")
-        exit(1)
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 
-    run_pipeline()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Genera pares contrafactuales para evaluación XAI"
+    )
+    parser.add_argument(
+        "--inpainting",
+        choices=["replicate", "lama"],
+        default="replicate",
+        help="Backend de inpainting a usar (default: replicate)"
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=N_IMAGES,
+        help=f"Número de imágenes a procesar (default: {N_IMAGES})"
+    )
+    args = parser.parse_args()
+
+    # Permitir sobreescribir N_IMAGES desde CLI
+    if args.n != N_IMAGES:
+        N_IMAGES = args.n
+
+    run_pipeline(args.inpainting)

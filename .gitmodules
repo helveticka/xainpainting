@@ -1,0 +1,3 @@
+[submodule "models/lama"]
+	path = models/lama
+	url = https://github.com/advimman/lama.git

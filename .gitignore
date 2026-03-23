@@ -1,14 +1,19 @@
-# Outputs y datos grandes
+# Outputs generados
 output/
-coco_images/
+output_lama/
+output_replicate/
 lama_test_input/
 lama_test_output/
-*.json
+lama_test_output_refined/
+experiments/
+
+# Datos grandes
+data/
 *.zip
 
 # Checkpoints y modelos
 checkpoints/
-big-lama/
+models/lama/big-lama/
 *.pt
 *.pth
 
@@ -17,4 +22,8 @@ tfg_env/
 lama_env/
 __pycache__/
 *.pyc
+*.pyc
+
+# Sistema
 .DS_Store
+predict.log

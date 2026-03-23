@@ -8,19 +8,13 @@ dependencies:
   - pip:
     - torch
     - torchvision
-    - sam2
+    - git+https://github.com/facebookresearch/sam2.git
     - replicate
     - pycocotools
     - Pillow
-    - numpy==1.24.4
+    - numpy
     - scikit-image
     - scikit-learn
     - requests
     - opencv-python
-    - easydict
-    - omegaconf==2.1.1
-    - hydra-core==1.1.0
-    - kornia
-    - pytorch-lightning==1.9.0
-    - albumentations==1.1.0
-    - imgaug==0.4.0
+    - lpips
