@@ -1,0 +1,26 @@
+name: xai_env
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - torch
+    - torchvision
+    - sam2
+    - replicate
+    - pycocotools
+    - Pillow
+    - numpy==1.24.4
+    - scikit-image
+    - scikit-learn
+    - requests
+    - opencv-python
+    - easydict
+    - omegaconf==2.1.1
+    - hydra-core==1.1.0
+    - kornia
+    - pytorch-lightning==1.9.0
+    - albumentations==1.1.0
+    - imgaug==0.4.0
