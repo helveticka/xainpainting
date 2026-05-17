@@ -282,6 +282,56 @@ def run_inpainting_lama(image: np.ndarray, mask: np.ndarray) -> np.ndarray | Non
 
         return np.array(Image.open(output_path).convert("RGB"))
 
+# ─── PASO 3C: INPAINTING CON NANOBANANA + COMPOSICIÓN ─────────────────────────
+
+def run_inpainting_nanobanana(image: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """
+    Usa NanoBanana (google/imagen-4) para editar la imagen completa,
+    luego compone el resultado usando solo la región de la máscara SAM.
+    El fondo queda 100% preservado por construcción.
+    """
+    from scipy.ndimage import gaussian_filter
+    import replicate
+
+    try:
+        img_b64 = _to_base64_png(image)
+
+        output = replicate.run(
+            "google/imagen-4",
+            input={
+                "image":  f"data:image/png;base64,{img_b64}",
+                "prompt": "Remove the car completely. Fill the area with natural background consistent with the surroundings. No artifacts, no traces of the car.",
+            }
+        )
+
+        result_url = output[0] if isinstance(output, list) else output
+        r          = requests.get(str(result_url), timeout=30)
+        nb_result  = np.array(Image.open(io.BytesIO(r.content)).convert("RGB"))
+
+        # Ajustar dimensiones si NanoBanana cambia el tamaño
+        if nb_result.shape != image.shape:
+            nb_result = np.array(
+                Image.fromarray(nb_result).resize(
+                    (image.shape[1], image.shape[0]),
+                    Image.LANCZOS
+                )
+            )
+
+        # Composición: pegar solo la región de la máscara
+        mask_float  = mask.astype(np.float32)
+        mask_smooth = gaussian_filter(mask_float, sigma=2)
+        mask_3ch    = np.stack([mask_smooth] * 3, axis=2)
+
+        result = (
+            image * (1 - mask_3ch) +
+            nb_result * mask_3ch
+        ).astype(np.uint8)
+
+        return result
+
+    except Exception as e:
+        print(f"  [ERROR] NanoBanana falló: {e}")
+        return None
 
 # ─── PASO 4: MÉTRICAS ─────────────────────────────────────────────────────────
 
@@ -360,6 +410,13 @@ def run_pipeline(backend: str):
     elif backend == "lama":
         run_inpainting = run_inpainting_lama
         print(f"Backend: LaMa local ({LAMA_MODEL})")
+
+    elif backend == "nanobanana":
+        if not os.environ.get("REPLICATE_API_TOKEN"):
+            print("[ERROR] Falta REPLICATE_API_TOKEN.")
+            sys.exit(1)
+        run_inpainting = run_inpainting_nanobanana
+        print("Backend: NanoBanana (google/imagen-4) + composición SAM")
     else:
         print(f"[ERROR] Backend desconocido: {backend}. Usa 'replicate' o 'lama'.")
         sys.exit(1)
@@ -461,7 +518,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--inpainting",
-        choices=["replicate", "lama"],
+        choices=["replicate", "lama", "nanobanana"],
         default="replicate",
         help="Backend de inpainting a usar (default: replicate)"
     )
