@@ -1,416 +1,575 @@
 """
 xai_analysis.py
 ---------------
-Aplica Integrated Gradients (IG) a cada par de imágenes del dataset counterfactual
-(original + inpainted) y genera:
-  - Mapas de atribución visualizados (heatmaps)
-  - Métricas de cambio de explicación por par
-  - Un JSON con los resultados agregados
-  - Una figura resumen comparativa
+Aplica Integrated Gradients (IG) sobre el classificador binari entrenat
+(amb cotxe=1 / sense cotxe=0).
 
-Uso:
-    conda activate xai_env   (o deep_blue311, el que tenga captum)
-    python xai_analysis.py --dataset-dir data/iopaint_dataset --output-dir data/xai_results
+Sortides:
+  - xai_results.json        → mètriques numèriques de tots els parells
+  - xai_summary.png         → figura resum agregada (4 gràfics)
+  - figures/                → figures individuals NOMÉS dels N casos
+                               més representatius (--top-n, default 20)
+  - informe.html            → informe lleuger: estadístiques + taula +
+                               figures dels casos seleccionats (~2-5 MB)
 
-Requisitos:
-    pip install torch torchvision captum matplotlib opencv-python scikit-image tqdm
+La figura individual per parell s'ha eliminat de l'informe massiu.
+Amb 410 parells, generar una figura per a cada un produïa ~580 MB.
+
+Ús:
+    python xai_analysis.py \
+        --model data/finetune/resnet18_car_classifier.pth \
+        --dataset-dir data/iopaint_dataset \
+        --output-dir data/xai_results \
+        --device mps
 """
 
 import argparse
+import base64
 import json
-import os
+import torch.nn.functional as F
 from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from captum.attr import IntegratedGradients
 from PIL import Image
-from skimage.metrics import structural_similarity as ssim
 from torchvision import models, transforms
+from torchvision.models import ResNet18_Weights
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# Configuración
+# Configuració
 # ---------------------------------------------------------------------------
 
-# Clases ImageNet relacionadas con vehículos (para diagnóstico)
-# No filtramos por ellas, pero las mostramos en los resultados
-CAR_RELATED_IMAGENET = {
-    817: "sports_car", 511: "convertible", 656: "minivan",
-    627: "limousine", 468: "cab", 751: "racer", 779: "school_bus",
-    829: "streetcar", 654: "minibus", 407: "ambulance",
-}
+IG_TARGET = 1   # classe "amb cotxe"
 
-# Umbral para considerar que un píxel "cambió" en la explicación
-ATTR_CHANGE_THRESHOLD = 0.1   # sobre mapa normalizado [0, 1]
+preprocess = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
 
-
-# ---------------------------------------------------------------------------
-# Preprocesado (idéntico al tutorial del tutor)
-# ---------------------------------------------------------------------------
-
-transform = transforms.Compose([
+preprocess_vis = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
 ])
 
-transform_normalize = transforms.Normalize(
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225]
-)
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+def carregar_model(model_path: Path, device: torch.device) -> nn.Module:
+    model = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    model.fc = nn.Linear(512, 2)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval().to(device)
+    print(f"Model carregat: {model_path.name}")
+    return model
 
 
-def load_image(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Carga una imagen y devuelve:
-      - input_tensor:     tensor normalizado listo para el modelo  (1, 3, 224, 224)
-      - transformed_img:  tensor sin normalizar para visualización (3, 224, 224)
-    """
+# ---------------------------------------------------------------------------
+# Funcions XAI
+# ---------------------------------------------------------------------------
+
+def carregar_imatge(path: Path):
     img = Image.open(path).convert("RGB")
-    transformed_img = transform(img)
-    input_tensor = transform_normalize(transformed_img).unsqueeze(0)
-    return input_tensor, transformed_img
+    return preprocess(img).unsqueeze(0), preprocess_vis(img)
 
 
-# ---------------------------------------------------------------------------
-# Funciones XAI (basadas en el tutorial del tutor)
-# ---------------------------------------------------------------------------
-
-def normalize_data(arr: np.ndarray) -> np.ndarray:
-    """Normaliza un array a [0, 1]."""
+def mapa_ig(atribucions: torch.Tensor) -> np.ndarray:
+    """(1,3,224,224) → (224,224) en [0,1]. Idèntic al tutorial del tutor."""
+    arr = atribucions.cpu().detach().numpy()[0]
+    arr = np.abs(arr)
     mn, mx = arr.min(), arr.max()
-    if mx - mn < 1e-8:
-        return np.zeros_like(arr)
-    return (arr - mn) / (mx - mn)
+    if mx - mn > 1e-8:
+        arr = (arr - mn) / (mx - mn)
+    return arr.mean(axis=0)
 
 
-def viz_xai(attributions: torch.Tensor) -> np.ndarray:
-    """
-    Convierte las atribuciones IG a un mapa 2D visualizable.
-    Sigue exactamente la función del tutorial del tutor:
-      - Toma valor absoluto
-      - Normaliza a [0, 1]
-      - Promedia los 3 canales → (224, 224)
-    """
-    arr_np = attributions.cpu().detach().numpy()[0]   # (3, 224, 224)
-    return np.mean(normalize_data(np.abs(arr_np)), axis=0)  # (224, 224)
+def focus_score(attr: np.ndarray, mask: np.ndarray) -> float:
+    """Fracció de l'atribució total dins la màscara del cotxe."""
+    total = attr.sum()
+    if total < 1e-8:
+        return 0.0
+    return float(attr[mask.astype(bool)].sum() / total)
 
 
-def compute_ig(model, input_tensor: torch.Tensor, target_class: int,
-               n_steps: int = 50) -> torch.Tensor:
-    """
-    Aplica Integrated Gradients con baseline negro (igual que en el tutorial).
-    """
-    ig = IntegratedGradients(model)
-    attributions = ig.attribute(input_tensor, target=target_class, n_steps=n_steps)
-    return attributions
+def overlay_heatmap(img_tensor, attr_map: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    img     = np.clip(img_tensor.permute(1, 2, 0).numpy(), 0, 1)
+    heatmap = plt.cm.hot(attr_map)[:, :, :3]
+    return np.clip(img * (1 - alpha) + heatmap * alpha, 0, 1)
 
 
 # ---------------------------------------------------------------------------
-# Métricas de cambio de explicación
+# Figura d'un parell individual (es desa en disc, NO s'incrusta massivament)
 # ---------------------------------------------------------------------------
 
-def explanation_change_metrics(attr_orig: np.ndarray, attr_inp: np.ndarray,
-                                mask_224: np.ndarray) -> dict:
-    """
-    Calcula cuánto cambia la explicación entre la imagen original e inpainted,
-    especialmente en la región de la máscara (donde estaba el coche).
+def figura_parell(entry: dict, model, ig, device: torch.device,
+                  figures_dir: Path) -> Path:
+    """Genera i desa la figura de 6 panells per a un parell concret."""
+    pair_id = Path(entry["file_name"]).stem
 
-    Parámetros
-    ----------
-    attr_orig : mapa de atribución de la imagen original   (224, 224) en [0, 1]
-    attr_inp  : mapa de atribución de la imagen inpainted  (224, 224) en [0, 1]
-    mask_224  : máscara binaria redimensionada a 224x224   (224, 224) bool
+    t_orig, v_orig = carregar_imatge(Path(entry["img_path"]))
+    t_inp,  v_inp  = carregar_imatge(Path(entry["inpainted_path"]))
+    t_orig, t_inp  = t_orig.to(device), t_inp.to(device)
 
-    Métricas devueltas
-    ------------------
-    - attr_diff_mean_mask   : cambio medio de atribución DENTRO de la máscara
-    - attr_diff_mean_outside: cambio medio de atribución FUERA de la máscara
-    - attr_orig_in_mask     : atribución media original dentro de la máscara
-    - attr_inp_in_mask      : atribución media inpainted dentro de la máscara
-    - relative_drop         : caída relativa de atribución en la región del coche
-                              (1 = desaparece completamente, 0 = no cambia)
-    - ssim_attr             : SSIM entre los dos mapas de atribución
-    """
-    diff = np.abs(attr_orig - attr_inp)
-    mask_bool = mask_224.astype(bool)
-    outside = ~mask_bool
+    with torch.no_grad():
+        out_orig = model(t_orig)
+        out_inp  = model(t_inp)
 
-    attr_orig_in  = float(attr_orig[mask_bool].mean()) if mask_bool.any() else 0.0
-    attr_inp_in   = float(attr_inp[mask_bool].mean())  if mask_bool.any() else 0.0
-    diff_in       = float(diff[mask_bool].mean())       if mask_bool.any() else 0.0
-    diff_out      = float(diff[outside].mean())          if outside.any() else 0.0
+    prob_orig = float(F.softmax(out_orig, dim=1)[0][IG_TARGET])
+    prob_inp  = float(F.softmax(out_inp,  dim=1)[0][IG_TARGET])
 
-    # Caída relativa: cuánto cayó la atribución en la zona del coche
-    relative_drop = float((attr_orig_in - attr_inp_in) / (attr_orig_in + 1e-8))
+    attr_orig = mapa_ig(ig.attribute(t_orig, target=IG_TARGET, n_steps=50))
+    attr_inp  = mapa_ig(ig.attribute(t_inp,  target=IG_TARGET, n_steps=50))
 
-    # SSIM entre mapas de atribución (mide similitud estructural de las explicaciones)
-    ssim_attr = float(ssim(attr_orig, attr_inp, data_range=1.0))
+    mask_raw = cv2.imread(entry["mask_path"], cv2.IMREAD_GRAYSCALE)
+    mask_224 = (cv2.resize(mask_raw, (224, 224),
+                           interpolation=cv2.INTER_NEAREST) > 127).astype(np.uint8)
 
-    return {
-        "attr_orig_in_mask":    round(attr_orig_in, 4),
-        "attr_inp_in_mask":     round(attr_inp_in, 4),
-        "attr_diff_mean_mask":  round(diff_in, 4),
-        "attr_diff_mean_outside": round(diff_out, 4),
-        "relative_drop":        round(relative_drop, 4),
-        "ssim_attr":            round(ssim_attr, 4),
-    }
+    f_orig = focus_score(attr_orig, mask_224)
+    f_inp  = focus_score(attr_inp,  mask_224)
 
-
-# ---------------------------------------------------------------------------
-# Visualización de un par
-# ---------------------------------------------------------------------------
-
-def visualize_pair(img_orig_t: torch.Tensor, img_inp_t: torch.Tensor,
-                   attr_orig: np.ndarray, attr_inp: np.ndarray,
-                   mask_224: np.ndarray,
-                   pred_orig: int, pred_inp: int,
-                   pair_id: str, output_dir: Path):
-    """
-    Genera una figura con 6 paneles para un par:
-      [orig] [inpainted] [mask]
-      [IG orig] [IG inpainted] [diff IG]
-    """
     def t2img(t):
-        """Tensor (3, H, W) → numpy (H, W, 3) en [0, 1]."""
-        arr = t.permute(1, 2, 0).numpy()
-        return np.clip(arr, 0, 1)
+        return np.clip(t.permute(1, 2, 0).numpy(), 0, 1)
 
-    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
-    fig.suptitle(f"Par: {pair_id}\n"
-                 f"Pred original: {pred_orig}  |  Pred inpainted: {pred_inp}",
-                 fontsize=11)
+    canvi_str = "✓ CANVIA" if (prob_orig >= 0.5) != (prob_inp >= 0.5) else "✗ no canvia"
 
-    # Fila 1: imágenes
-    axes[0, 0].imshow(t2img(img_orig_t))
-    axes[0, 0].set_title("Imagen original")
-    axes[0, 0].axis("off")
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    fig.suptitle(
+        f"Parell: {pair_id}  [{canvi_str}]\n"
+        f"Prob(cotxe): {prob_orig:.3f} → {prob_inp:.3f}   "
+        f"Focus: {f_orig:.3f} → {f_inp:.3f}  (Δ={f_orig-f_inp:+.3f})",
+        fontsize=10
+    )
 
-    axes[0, 1].imshow(t2img(img_inp_t))
-    axes[0, 1].set_title("Imagen inpainted (sin coche)")
-    axes[0, 1].axis("off")
+    axes[0, 0].imshow(t2img(v_orig)); axes[0, 0].set_title("Original");             axes[0, 0].axis("off")
+    axes[0, 1].imshow(t2img(v_inp));  axes[0, 1].set_title("Inpaintat (sense cotxe)"); axes[0, 1].axis("off")
+    axes[0, 2].imshow(mask_224, cmap="gray"); axes[0, 2].set_title("Màscara");       axes[0, 2].axis("off")
 
-    axes[0, 2].imshow(mask_224, cmap="gray")
-    axes[0, 2].set_title("Máscara (región del coche)")
-    axes[0, 2].axis("off")
+    axes[1, 0].imshow(overlay_heatmap(v_orig, attr_orig))
+    axes[1, 0].set_title(f"IG original  Focus={f_orig:.3f}"); axes[1, 0].axis("off")
 
-    # Fila 2: explicaciones
-    im1 = axes[1, 0].imshow(attr_orig, cmap="hot", vmin=0, vmax=1)
-    axes[1, 0].set_title("IG — imagen original")
-    axes[1, 0].axis("off")
-    plt.colorbar(im1, ax=axes[1, 0], fraction=0.046)
-
-    im2 = axes[1, 1].imshow(attr_inp, cmap="hot", vmin=0, vmax=1)
-    axes[1, 1].set_title("IG — imagen inpainted")
-    axes[1, 1].axis("off")
-    plt.colorbar(im2, ax=axes[1, 1], fraction=0.046)
+    axes[1, 1].imshow(overlay_heatmap(v_inp, attr_inp))
+    axes[1, 1].set_title(f"IG inpaintat  Focus={f_inp:.3f}"); axes[1, 1].axis("off")
 
     diff = attr_orig - attr_inp
-    im3 = axes[1, 2].imshow(diff, cmap="RdBu_r", vmin=-1, vmax=1)
-    axes[1, 2].set_title("Diferencia IG (orig − inp)\nRojo = atención perdida")
-    axes[1, 2].axis("off")
-    plt.colorbar(im3, ax=axes[1, 2], fraction=0.046)
+    im   = axes[1, 2].imshow(diff, cmap="RdBu_r", vmin=-1, vmax=1)
+    axes[1, 2].set_title("Diferència IG\nVermell = atenció perduda"); axes[1, 2].axis("off")
+    plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
 
     plt.tight_layout()
-    out_path = output_dir / f"{pair_id}_xai.png"
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    path = figures_dir / f"{pair_id}_xai.png"
+    plt.savefig(path, dpi=100, bbox_inches="tight")
     plt.close()
-    return out_path
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Figura resum agregada
+# ---------------------------------------------------------------------------
+
+def figura_resum(resultats: list, output_dir: Path) -> Path:
+    n          = len(resultats)
+    focus_drop = [r["focus_drop"]    for r in resultats]
+    prob_drop  = [r["prob_car_drop"] for r in resultats]
+    focus_orig = [r["focus_orig"]    for r in resultats]
+    baselines  = [r["focus_baseline"] for r in resultats]
+    canvis     = [r["pred_changed"]  for r in resultats]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    fig.suptitle(
+        f"Resum XAI — {n} parells  |  ResNet-18 fine-tuned  |  "
+        f"Predicció canvia: {sum(canvis)}/{n} ({100*sum(canvis)/n:.0f}%)",
+        fontsize=12
+    )
+
+    # 1. Distribució caiguda Focus
+    axes[0, 0].hist(focus_drop, bins=20, color="steelblue", edgecolor="white")
+    axes[0, 0].axvline(np.mean(focus_drop), color="red", linestyle="--",
+                       label=f"Mitjana = {np.mean(focus_drop):.3f}")
+    axes[0, 0].axvline(0, color="black", linewidth=1)
+    axes[0, 0].set_title("Distribució caiguda Focus (orig − inp)")
+    axes[0, 0].set_xlabel("focus_drop  (>0 = model mirava el cotxe)")
+    axes[0, 0].set_ylabel("Nº parells"); axes[0, 0].legend(fontsize=9)
+
+    # 2. Distribució caiguda prob(cotxe)
+    axes[0, 1].hist(prob_drop, bins=20, color="coral", edgecolor="white")
+    axes[0, 1].axvline(np.mean(prob_drop), color="red", linestyle="--",
+                       label=f"Mitjana = {np.mean(prob_drop):.3f}")
+    axes[0, 1].axvline(0, color="black", linewidth=1)
+    axes[0, 1].set_title("Distribució caiguda prob(cotxe)")
+    axes[0, 1].set_xlabel("Δ prob(cotxe)  (>0 = predicció s'allunya del cotxe)")
+    axes[0, 1].set_ylabel("Nº parells"); axes[0, 1].legend(fontsize=9)
+
+    # 3. Focus orig vs baseline (scatter)
+    colors = ["#c0392b" if c else "#3498db" for c in canvis]
+    axes[1, 0].scatter(baselines, focus_orig, c=colors, alpha=0.5,
+                       edgecolors="none", s=20)
+    mn = min(min(baselines), min(focus_orig))
+    mx = max(max(baselines), max(focus_orig))
+    axes[1, 0].plot([mn, mx], [mn, mx], "k--", linewidth=1, label="Focus = baseline")
+    axes[1, 0].set_xlabel("Baseline (àrea màscara / àrea total)")
+    axes[1, 0].set_ylabel("Focus score (imatge original)")
+    axes[1, 0].set_title("Focus vs baseline\nRoig = predicció canvia")
+    axes[1, 0].legend(fontsize=8)
+
+    # 4. Focus drop vs prob drop (scatter)
+    axes[1, 1].scatter(prob_drop, focus_drop, c=colors, alpha=0.5,
+                       edgecolors="none", s=20)
+    axes[1, 1].axhline(0, color="black", linewidth=0.8)
+    axes[1, 1].axvline(0, color="black", linewidth=0.8)
+    axes[1, 1].set_xlabel("Δ prob(cotxe)")
+    axes[1, 1].set_ylabel("Caiguda Focus")
+    axes[1, 1].set_title("Δ prob vs caiguda Focus\nRoig = predicció canvia")
+
+    plt.tight_layout()
+    path = output_dir / "xai_summary.png"
+    plt.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close()
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Selecció de casos representatius per a l'informe
+# ---------------------------------------------------------------------------
+
+def seleccionar_casos(resultats: list, metadata: list, top_n: int) -> list:
+    """
+    Selecciona top_n casos representatius per mostrar a l'informe:
+      - Els millors per focus_drop (IG detecta clarament el cotxe)
+      - Els millors per prob_drop (predicció canvia molt)
+      - Alguns casos amb focus_drop negatiu (comportament paradoxal)
+
+    Evita duplicats. Retorna les entrades de metadata corresponents.
+    """
+    meta_per_id = {Path(e["file_name"]).stem: e for e in metadata}
+
+    per_focus = sorted(resultats, key=lambda r: r["focus_drop"], reverse=True)
+    per_prob  = sorted(resultats, key=lambda r: r["prob_car_drop"], reverse=True)
+    paradoxes = sorted(
+        [r for r in resultats if r["focus_drop"] < -0.05],
+        key=lambda r: r["focus_drop"]
+    )
+
+    vistos = set()
+    seleccionats = []
+
+    quota_focus    = max(1, top_n // 2)
+    quota_prob     = max(1, top_n // 3)
+    quota_paradox  = max(1, top_n // 6)
+
+    for r in per_focus[:quota_focus]:
+        if r["pair_id"] not in vistos and r["pair_id"] in meta_per_id:
+            seleccionats.append((r, meta_per_id[r["pair_id"]]))
+            vistos.add(r["pair_id"])
+
+    for r in per_prob[:quota_prob]:
+        if r["pair_id"] not in vistos and r["pair_id"] in meta_per_id:
+            seleccionats.append((r, meta_per_id[r["pair_id"]]))
+            vistos.add(r["pair_id"])
+
+    for r in paradoxes[:quota_paradox]:
+        if r["pair_id"] not in vistos and r["pair_id"] in meta_per_id:
+            seleccionats.append((r, meta_per_id[r["pair_id"]]))
+            vistos.add(r["pair_id"])
+
+    return seleccionats[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# Informe HTML lleuger
+# ---------------------------------------------------------------------------
+
+def img_b64(path: Path) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def generar_informe(resultats: list, summary_path: Path,
+                    casos_figures: list,   # [(resultat, path_figura)]
+                    output_dir: Path):
+
+    n          = len(resultats)
+    n_canvis   = sum(r["pred_changed"] for r in resultats)
+    mean_fdrop = np.mean([r["focus_drop"]     for r in resultats])
+    std_fdrop  = np.std( [r["focus_drop"]     for r in resultats])
+    mean_pdrop = np.mean([r["prob_car_drop"]  for r in resultats])
+    std_pdrop  = np.std( [r["prob_car_drop"]  for r in resultats])
+    mean_forig = np.mean([r["focus_orig"]     for r in resultats])
+    mean_finp  = np.mean([r["focus_inp"]      for r in resultats])
+    mean_base  = np.mean([r["focus_baseline"] for r in resultats])
+    above_base = sum(1 for r in resultats if r["focus_orig"] > r["focus_baseline"])
+
+    summary_b64 = img_b64(summary_path)
+
+    # Taula completa (sense imatges → lleugera)
+    files_taula = ""
+    for r in sorted(resultats, key=lambda x: x["focus_drop"], reverse=True):
+        canvi_cls = "si" if r["pred_changed"] else "no"
+        canvi_str = "✓" if r["pred_changed"] else "✗"
+        files_taula += (
+            f'<tr class="c{canvi_cls}">'
+            f'<td>{r["pair_id"]}</td>'
+            f'<td>{r["prob_car_orig"]:.3f}</td>'
+            f'<td>{r["prob_car_inp"]:.3f}</td>'
+            f'<td>{r["prob_car_drop"]:+.3f}</td>'
+            f'<td>{r["focus_orig"]:.3f}</td>'
+            f'<td>{r["focus_inp"]:.3f}</td>'
+            f'<td><b>{r["focus_drop"]:+.3f}</b></td>'
+            f'<td>{r["focus_baseline"]:.3f}</td>'
+            f'<td class="c{canvi_cls}">{canvi_str}</td>'
+            f'</tr>\n'
+        )
+
+    # Seccions dels casos representatius (amb figura)
+    seccions = ""
+    for r, fig_path in casos_figures:
+        b64       = img_b64(fig_path)
+        canvi_str = "✓ Predicció canvia" if r["pred_changed"] else "✗ Predicció no canvia"
+        badge_cls = "si" if r["pred_changed"] else "no"
+
+        if r["focus_drop"] > 0.05:
+            interpretacio = (f"IG perd {r['focus_drop']:.3f} de Focus sobre la zona del cotxe. "
+                             "El model mirava clarament el cotxe i deixa de fer-ho quan s'elimina.")
+        elif r["focus_drop"] < -0.02:
+            interpretacio = (f"Focus augmenta {abs(r['focus_drop']):.3f} sobre la zona inpaintada. "
+                             "Possible artefacte: LaMa ha generat textura que activa features de cotxe.")
+        else:
+            interpretacio = ("Canvi de Focus mínim. El cotxe no era la característica "
+                             "central per a la decisió del model en aquest cas.")
+
+        seccions += f"""
+<div class="cas">
+  <div class="cas-cap">
+    <h3>{r['pair_id']}</h3>
+    <span class="badge b{badge_cls}">{canvi_str}</span>
+  </div>
+  <div class="nums">
+    <span>prob orig: <b>{r['prob_car_orig']:.3f}</b></span>
+    <span>prob inp: <b>{r['prob_car_inp']:.3f}</b></span>
+    <span>Δ prob: <b>{r['prob_car_drop']:+.3f}</b></span>
+    <span>Focus orig: <b>{r['focus_orig']:.3f}</b></span>
+    <span>Focus inp: <b>{r['focus_inp']:.3f}</b></span>
+    <span>Caiguda Focus: <b>{r['focus_drop']:+.3f}</b></span>
+  </div>
+  <p class="interp">{interpretacio}</p>
+  <img src="data:image/png;base64,{b64}" style="width:100%">
+</div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="ca">
+<head>
+<meta charset="UTF-8">
+<title>Informe XAI — Integrated Gradients</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+     background:#f5f5f7;color:#1d1d1f;line-height:1.5}}
+.wrap{{max-width:1100px;margin:0 auto;padding:2rem 1rem}}
+h1{{font-size:1.8rem;font-weight:700;margin-bottom:.3rem}}
+h2{{font-size:1.15rem;font-weight:600;margin:2rem 0 .8rem;
+   border-bottom:2px solid #e0e0e0;padding-bottom:.3rem}}
+h3{{font-size:1rem;font-weight:600}}
+.sub{{color:#666;margin-bottom:1.5rem;font-size:.9rem}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+       gap:.8rem;margin:1rem 0}}
+.card{{background:#fff;border-radius:10px;padding:.9rem 1.1rem;
+       box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+.val{{font-size:1.5rem;font-weight:700}}
+.lbl{{font-size:.75rem;color:#888;margin-top:.15rem}}
+.resum img{{width:100%;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.1)}}
+.wrap-t{{overflow-x:auto;margin:.8rem 0}}
+table{{width:100%;border-collapse:collapse;background:#fff;font-size:.82rem;
+       border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+th{{background:#f0f0f5;padding:.5rem .7rem;text-align:left;font-weight:600;color:#555}}
+td{{padding:.45rem .7rem;border-top:1px solid #f0f0f0}}
+tr.csi td{{background:#fff8f8}}
+td.csi{{color:#c0392b;font-weight:600}}
+td.cno{{color:#888}}
+.cas{{background:#fff;border-radius:12px;padding:1.3rem;margin:1.2rem 0;
+      box-shadow:0 1px 6px rgba(0,0,0,.08)}}
+.cas-cap{{display:flex;align-items:center;gap:.8rem;margin-bottom:.6rem}}
+.badge{{padding:.2rem .6rem;border-radius:20px;font-size:.78rem;font-weight:600}}
+.bsi{{background:#fde8e8;color:#c0392b}}
+.bno{{background:#eef;color:#556}}
+.nums{{display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;
+       font-size:.82rem;color:#555;margin-bottom:.5rem}}
+.interp{{font-size:.85rem;color:#444;background:#f9f9fb;
+          border-left:3px solid #0071e3;padding:.45rem .7rem;
+          border-radius:0 6px 6px 0;margin-bottom:.7rem}}
+footer{{margin-top:2.5rem;text-align:center;color:#aaa;font-size:.78rem}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Informe XAI — Integrated Gradients</h1>
+<p class="sub">Model: ResNet-18 fine-tuned (binari cotxe/sense cotxe) &nbsp;·&nbsp;
+Dataset: COCO 2017 train &nbsp;·&nbsp; {n} parells analitzats</p>
+
+<h2>Mètriques globals</h2>
+<div class="grid">
+  <div class="card"><div class="val">{n}</div><div class="lbl">Parells analitzats</div></div>
+  <div class="card"><div class="val">{n_canvis}/{n}</div><div class="lbl">Predicció canvia ({100*n_canvis/n:.0f}%)</div></div>
+  <div class="card"><div class="val">{mean_forig:.3f}</div><div class="lbl">Focus mitjà original</div></div>
+  <div class="card"><div class="val">{mean_finp:.3f}</div><div class="lbl">Focus mitjà inpaintat</div></div>
+  <div class="card"><div class="val">{mean_base:.3f}</div><div class="lbl">Baseline aleatori</div></div>
+  <div class="card"><div class="val">{mean_fdrop:+.3f}</div><div class="lbl">Caiguda Focus (±{std_fdrop:.3f})</div></div>
+  <div class="card"><div class="val">{mean_pdrop:+.3f}</div><div class="lbl">Δ prob(cotxe) (±{std_pdrop:.3f})</div></div>
+  <div class="card"><div class="val">{above_base}/{n}</div><div class="lbl">Focus orig &gt; baseline ({100*above_base/n:.0f}%)</div></div>
+</div>
+
+<h2>Figura resum</h2>
+<div class="resum"><img src="data:image/png;base64,{summary_b64}" alt="Resum XAI"></div>
+
+<h2>Taula de resultats — tots els parells</h2>
+<div class="wrap-t">
+<table>
+<thead><tr>
+  <th>Parell</th><th>prob orig</th><th>prob inp</th><th>Δ prob</th>
+  <th>Focus orig</th><th>Focus inp</th><th>Δ Focus</th><th>Baseline</th><th>Canvi</th>
+</tr></thead>
+<tbody>{files_taula}</tbody>
+</table>
+</div>
+
+<h2>Casos representatius ({len(casos_figures)} seleccionats)</h2>
+<p class="sub">Selecció automàtica: millors per caiguda Focus, millors per Δ prob, i casos paradoxals (Focus puja però predicció canvia).</p>
+{seccions}
+
+<footer>Generat per xai_analysis.py &nbsp;·&nbsp; ResNet-18 fine-tuned &nbsp;·&nbsp; Integrated Gradients (Captum)</footer>
+</div></body></html>"""
+
+    path = output_dir / "informe.html"
+    path.write_text(html, encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
 
-def run_xai_pipeline(dataset_dir: Path, output_dir: Path, n_steps: int,
-                     device_str: str, max_pairs: int):
+def run(model_path: Path, dataset_dir: Path, output_dir: Path,
+        n_steps: int, device_str: str, top_n: int):
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    pairs_dir = output_dir / "pair_figures"
-    pairs_dir.mkdir(exist_ok=True)
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(exist_ok=True)
 
-    # ── Cargar modelo (ResNet-18, igual que el tutorial) ─────────────────
-    device = torch.device(device_str)
-    print(f"[INFO] Cargando ResNet-18 en {device}...")
-    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-    model.eval()
-    model.to(device)
-
-    # ── Leer metadatos del dataset ────────────────────────────────────────
-    metadata_file = dataset_dir / "dataset_metadata.json"
-    if not metadata_file.exists():
-        raise FileNotFoundError(
-            f"No se encontró dataset_metadata.json en {dataset_dir}.\n"
-            "Asegúrate de haber ejecutado pipeline_iopaint.py primero."
-        )
-
-    with open(metadata_file) as f:
+    # Metadades
+    with open(dataset_dir / "dataset_metadata.json") as f:
         metadata = json.load(f)
 
-    # Filtrar pares con inpainted disponible y sin error
-    valid_pairs = [
+    parells = [
         e for e in metadata
-        if "error" not in e.get("metrics", {})
-        and Path(e["inpainted_path"]).exists()
-        and Path(e["img_path"]).exists()
+        if Path(e["img_path"]).exists() and Path(e["inpainted_path"]).exists()
     ]
+    print(f"Parells disponibles: {len(parells)}")
 
-    if not valid_pairs:
-        raise RuntimeError("No hay pares válidos en el dataset. Revisa los paths.")
+    # Model
+    device = torch.device(device_str)
+    model  = carregar_model(model_path, device)
+    ig     = IntegratedGradients(model)
+    print(f"Target IG: classe {IG_TARGET} (amb cotxe)\n")
 
-    if max_pairs > 0:
-        valid_pairs = valid_pairs[:max_pairs]
+    # ── Bucle principal: càlcul de mètriques (sense generar figures) ────────
+    resultats = []
 
-    print(f"[INFO] Procesando {len(valid_pairs)} pares...")
-
-    results = []
-
-    for entry in tqdm(valid_pairs, desc="Aplicando IG"):
+    for entry in tqdm(parells, desc="Calculant mètriques IG"):
         pair_id = Path(entry["file_name"]).stem
-
-        # ── Cargar imágenes ───────────────────────────────────────────────
-        orig_path = Path(entry["img_path"])
-        inp_path  = Path(entry["inpainted_path"])
-
         try:
-            input_orig, img_orig_t = load_image(orig_path)
-            input_inp,  img_inp_t  = load_image(inp_path)
-        except Exception as ex:
-            print(f"[WARN] Error cargando {pair_id}: {ex}")
+            t_orig, _ = carregar_imatge(Path(entry["img_path"]))
+            t_inp,  _ = carregar_imatge(Path(entry["inpainted_path"]))
+        except Exception as e:
+            print(f"  Error carregant {pair_id}: {e}")
             continue
 
-        input_orig = input_orig.to(device)
-        input_inp  = input_inp.to(device)
+        t_orig, t_inp = t_orig.to(device), t_inp.to(device)
 
-        # ── Predicciones ─────────────────────────────────────────────────
         with torch.no_grad():
-            out_orig = model(input_orig)
-            out_inp  = model(input_inp)
+            out_orig = model(t_orig)
+            out_inp  = model(t_inp)
 
-        pred_orig = int(torch.argmax(out_orig, dim=1).item())
-        pred_inp  = int(torch.argmax(out_inp,  dim=1).item())
+        probs_orig    = F.softmax(out_orig, dim=1)[0]
+        probs_inp     = F.softmax(out_inp,  dim=1)[0]
+        prob_car_orig = float(probs_orig[IG_TARGET])
+        prob_car_inp  = float(probs_inp[IG_TARGET])
+        pred_changed  = (prob_car_orig >= 0.5) != (prob_car_inp >= 0.5)
 
-        prob_orig = float(F.softmax(out_orig, dim=1).max().item())
-        prob_inp  = float(F.softmax(out_inp,  dim=1).max().item())
-
-        # ── Integrated Gradients ─────────────────────────────────────────
         try:
-            attr_orig_t = compute_ig(model, input_orig, pred_orig, n_steps)
-            attr_inp_t  = compute_ig(model, input_inp,  pred_inp,  n_steps)
-        except Exception as ex:
-            print(f"[WARN] Error en IG para {pair_id}: {ex}")
+            attr_orig = mapa_ig(ig.attribute(t_orig, target=IG_TARGET, n_steps=n_steps))
+            attr_inp  = mapa_ig(ig.attribute(t_inp,  target=IG_TARGET, n_steps=n_steps))
+        except Exception as e:
+            print(f"  Error IG {pair_id}: {e}")
             continue
 
-        attr_orig = viz_xai(attr_orig_t)
-        attr_inp  = viz_xai(attr_inp_t)
-
-        # ── Máscara redimensionada a 224×224 ─────────────────────────────
         mask_raw = cv2.imread(entry["mask_path"], cv2.IMREAD_GRAYSCALE)
-        mask_224 = cv2.resize(mask_raw, (224, 224), interpolation=cv2.INTER_NEAREST)
-        mask_224 = (mask_224 > 127).astype(np.uint8)
+        mask_224 = (cv2.resize(mask_raw, (224, 224),
+                               interpolation=cv2.INTER_NEAREST) > 127).astype(np.uint8)
 
-        # ── Métricas de cambio de explicación ────────────────────────────
-        xai_metrics = explanation_change_metrics(attr_orig, attr_inp, mask_224)
+        f_orig     = focus_score(attr_orig, mask_224)
+        f_inp      = focus_score(attr_inp,  mask_224)
+        f_baseline = float(mask_224.astype(bool).mean())
 
-        # ── Visualización ─────────────────────────────────────────────────
-        fig_path = visualize_pair(
-            img_orig_t, img_inp_t,
-            attr_orig, attr_inp,
-            mask_224,
-            pred_orig, pred_inp,
-            pair_id, pairs_dir,
-        )
-
-        # ── Acumular resultado ────────────────────────────────────────────
-        results.append({
-            "pair_id":       pair_id,
-            "pred_orig":     pred_orig,
-            "pred_inp":      pred_inp,
-            "prob_orig":     round(prob_orig, 4),
-            "prob_inp":      round(prob_inp, 4),
-            "pred_changed":  pred_orig != pred_inp,
-            "is_car_pred":   pred_orig in CAR_RELATED_IMAGENET,
-            "xai_metrics":   xai_metrics,
-            "inpaint_metrics": entry.get("metrics", {}),
-            "figure_path":   str(fig_path),
+        resultats.append({
+            "pair_id":        pair_id,
+            "prob_car_orig":  round(prob_car_orig, 4),
+            "prob_car_inp":   round(prob_car_inp,  4),
+            "prob_car_drop":  round(prob_car_orig - prob_car_inp, 4),
+            "pred_changed":   pred_changed,
+            "focus_orig":     round(f_orig,     4),
+            "focus_inp":      round(f_inp,      4),
+            "focus_baseline": round(f_baseline, 4),
+            "focus_drop":     round(f_orig - f_inp, 4),
+            "car_area_pct":   entry.get("car_area_pct"),
         })
 
-    # ── Guardar resultados JSON ───────────────────────────────────────────
-    results_file = output_dir / "xai_results.json"
-    with open(results_file, "w") as f:
-        json.dump(results, f, indent=2)
+    # Desar JSON
+    with open(output_dir / "xai_results.json", "w") as f:
+        json.dump(resultats, f, indent=2)
 
-    # ── Figura resumen ────────────────────────────────────────────────────
-    _plot_summary(results, output_dir)
+    # Figura resum
+    summary_path = figura_resum(resultats, output_dir)
 
-    # ── Resumen por pantalla ──────────────────────────────────────────────
-    n = len(results)
-    print("\n" + "=" * 60)
-    print(f"RESULTADOS XAI — {n} pares procesados")
-    print("=" * 60)
-    if n > 0:
-        drops      = [r["xai_metrics"]["relative_drop"] for r in results]
-        ssims_attr = [r["xai_metrics"]["ssim_attr"]     for r in results]
-        changed    = sum(r["pred_changed"] for r in results)
-        car_preds  = sum(r["is_car_pred"]  for r in results)
+    # ── Generar figures NOMÉS dels casos seleccionats ───────────────────────
+    meta_per_id  = {Path(e["file_name"]).stem: e for e in metadata}
+    casos        = seleccionar_casos(resultats, metadata, top_n)
 
-        print(f"  Predicción cambia al inpaintar:  {changed}/{n} ({100*changed/n:.1f}%)")
-        print(f"  Pred. original era un coche:     {car_preds}/{n} ({100*car_preds/n:.1f}%)")
-        print(f"  Caída relativa de atribución")
-        print(f"    en la región del coche:        {np.mean(drops):.3f} ± {np.std(drops):.3f}")
-        print(f"  SSIM entre mapas de atribución:  {np.mean(ssims_attr):.3f} ± {np.std(ssims_attr):.3f}")
-        print(f"\n  Resultados guardados en: {output_dir}")
-    print("=" * 60)
+    print(f"\nGenerant figures dels {len(casos)} casos representatius...")
+    casos_figures = []
+    for r, entry in tqdm(casos, desc="Figures seleccionades"):
+        try:
+            fig_path = figura_parell(entry, model, ig, device, figures_dir)
+            casos_figures.append((r, fig_path))
+        except Exception as e:
+            print(f"  Error figura {r['pair_id']}: {e}")
 
+    # Informe HTML
+    informe_path = generar_informe(resultats, summary_path, casos_figures, output_dir)
 
-def _plot_summary(results: list, output_dir: Path):
-    """Genera una figura de resumen con distribuciones de las métricas clave."""
-    if not results:
-        return
+    # Resum
+    n = len(resultats)
+    canvis      = sum(r["pred_changed"]  for r in resultats)
+    focus_drops = [r["focus_drop"]       for r in resultats]
+    prob_drops  = [r["prob_car_drop"]    for r in resultats]
 
-    drops   = [r["xai_metrics"]["relative_drop"]     for r in results]
-    ssims_a = [r["xai_metrics"]["ssim_attr"]          for r in results]
-    diffs_m = [r["xai_metrics"]["attr_diff_mean_mask"] for r in results]
-    ssims_i = [r["inpaint_metrics"].get("ssim_global", None) for r in results]
-    ssims_i = [v for v in ssims_i if v is not None]
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("Resumen del experimento XAI — Integrated Gradients", fontsize=13)
-
-    axes[0].hist(drops, bins=10, color="steelblue", edgecolor="white")
-    axes[0].axvline(np.mean(drops), color="red", linestyle="--",
-                    label=f"Media={np.mean(drops):.2f}")
-    axes[0].set_title("Caída relativa de atribución\nen la región del coche")
-    axes[0].set_xlabel("relative_drop  (1 = desaparece del todo)")
-    axes[0].set_ylabel("Nº de pares")
-    axes[0].legend()
-
-    axes[1].hist(ssims_a, bins=10, color="coral", edgecolor="white")
-    axes[1].axvline(np.mean(ssims_a), color="red", linestyle="--",
-                    label=f"Media={np.mean(ssims_a):.2f}")
-    axes[1].set_title("SSIM entre mapas de atribución\n(orig vs inpainted)")
-    axes[1].set_xlabel("SSIM  (1 = explicaciones idénticas)")
-    axes[1].legend()
-
-    if ssims_i:
-        axes[2].scatter(ssims_i[:len(drops)], drops[:len(ssims_i)],
-                        alpha=0.7, color="seagreen", edgecolors="white")
-        axes[2].set_xlabel("SSIM inpainting (calidad pixel-level)")
-        axes[2].set_ylabel("Caída de atribución (utilidad XAI)")
-        axes[2].set_title("¿Correlaciona la calidad\nde inpainting con la utilidad XAI?")
-    else:
-        axes[2].text(0.5, 0.5, "Sin datos SSIM inpainting",
-                     ha="center", va="center", transform=axes[2].transAxes)
-
-    plt.tight_layout()
-    out_path = output_dir / "xai_summary.png"
-    plt.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close()
-    print(f"[INFO] Figura resumen guardada: {out_path}")
+    print(f"\n{'='*55}")
+    print(f"RESULTATS XAI — {n} parells")
+    print(f"{'='*55}")
+    print(f"  Predicció canvia:        {canvis}/{n} ({100*canvis/n:.0f}%)")
+    print(f"  Caiguda Focus (mitjana): {np.mean(focus_drops):.3f} ± {np.std(focus_drops):.3f}")
+    print(f"  Caiguda prob(cotxe):     {np.mean(prob_drops):.4f} ± {np.std(prob_drops):.4f}")
+    print(f"\n  Informe HTML:  {informe_path}")
+    print(f"  Figura resum:  {summary_path}")
+    print(f"  JSON:          {output_dir / 'xai_results.json'}")
+    print(f"{'='*55}")
 
 
 # ---------------------------------------------------------------------------
@@ -419,34 +578,22 @@ def _plot_summary(results: list, output_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Aplica Integrated Gradients al dataset counterfactual"
+        description="Aplica IG al classificador binari i genera informe lleuger"
     )
-    parser.add_argument(
-        "--dataset-dir", type=str, default="data/iopaint_dataset",
-        help="Directorio raíz del dataset generado por pipeline_iopaint.py"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="data/xai_results",
-        help="Directorio donde guardar los resultados XAI"
-    )
-    parser.add_argument(
-        "--n-steps", type=int, default=50,
-        help="Pasos de integración para IG (más pasos = más preciso, más lento)"
-    )
-    parser.add_argument(
-        "--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"],
-        help="Device: cpu / cuda / mps (Apple Silicon)"
-    )
-    parser.add_argument(
-        "--max-pairs", type=int, default=0,
-        help="Limitar a N pares (0 = todos)"
-    )
+    parser.add_argument("--model",       type=str, default="data/finetune/resnet18_car_classifier.pth")
+    parser.add_argument("--dataset-dir", type=str, default="data/iopaint_dataset")
+    parser.add_argument("--output-dir",  type=str, default="data/xai_results")
+    parser.add_argument("--n-steps",     type=int, default=50)
+    parser.add_argument("--device",      type=str, default="mps", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--top-n",       type=int, default=20,
+                        help="Nombre de casos representatius a incloure a l'informe (default: 20)")
     args = parser.parse_args()
 
-    run_xai_pipeline(
+    run(
+        model_path=Path(args.model),
         dataset_dir=Path(args.dataset_dir),
         output_dir=Path(args.output_dir),
         n_steps=args.n_steps,
         device_str=args.device,
-        max_pairs=args.max_pairs,
+        top_n=args.top_n,
     )
