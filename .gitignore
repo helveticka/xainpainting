@@ -5,7 +5,6 @@ output_replicate/
 lama_test_input/
 lama_test_output/
 lama_test_output_refined/
-experiments/
 
 # Datos grandes
 data/
@@ -22,7 +21,7 @@ tfg_env/
 lama_env/
 __pycache__/
 *.pyc
-*.pyc
+.ipynb_checkpoints/
 
 # Sistema
 .DS_Store
