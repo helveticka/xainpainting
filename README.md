@@ -1,6 +1,6 @@
-# xainpainting — fidelitat d'Integrated Gradients sobre parells contrafactuals
+# xainpainting: fidelitat d'Integrated Gradients sobre parells contrafactuals
 
-Pipeline per generar parells d'imatges contrafactuals (amb cotxe / mateixa escena sense cotxe) i mesurar si les explicacions d'Integrated Gradients (IG) sobre un classificador binari són fidels a la decisió real del model.
+Pipeline per generar parells d'imatges contrafactuals (amb cotxe / sense cotxe) i mesurar si les explicacions d'Integrated Gradients (IG) sobre un classificador binari són fidels a la decisió real del model.
 
 ## Resultat central
 
@@ -68,8 +68,6 @@ python src/compute_quality_metrics.py
 ## Notebook
 
 `notebooks/pipeline_walkthrough.ipynb` recorre el pipeline sencer sobre un únic parell (selecció → màscara → inpainting → classificació → IG → Focus). És el punt d'entrada recomanat per inspeccionar cada pas sense regenerar tot el dataset.
-
-Totes les seves dependències ja són a `requirements.txt`; per obrir-lo només fa falta Jupyter (`pip install jupyter ipywidgets`) — `ipywidgets` evita un avís cosmètic de `tqdm` sobre les barres de progrés dins del notebook.
 
 ## Estructura del repositori
 
