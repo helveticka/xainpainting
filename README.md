@@ -1,137 +1,98 @@
-# XAI Dataset Generation
+# xainpainting — fidelitat d'Integrated Gradients sobre parells contrafactuals
 
-Pipeline para la generación automática de pares contrafactuales fotorrealistes per a l'avaluació de mètodes d'Explainable AI (XAI).
+Pipeline per generar parells d'imatges contrafactuals (amb cotxe / mateixa escena sense cotxe) i mesurar si les explicacions d'Integrated Gradients (IG) sobre un classificador binari són fidels a la decisió real del model.
 
-## Descripció
+## Resultat central
 
-El pipeline genera parells d'imatges (original / sense objecte) usant:
-- **SAM 2** per a la segmentació precisa de l'objecte
-- **LaMa** (inpainting local) o **Replicate API** (bria/eraser) per eliminar l'objecte
-- Mètriques de qualitat: PCP, MAPD, SSIM
+Sobre 410 parells generats (91% amb canvi de predicció en eliminar el cotxe):
 
-## Requisits previs
+| Mètrica | Valor |
+|---|---|
+| Caiguda mitjana de P(cotxe) — fidelitat *conductual* | +0.825 ± 0.267 |
+| Caiguda mitjana de Focus — fidelitat *atribucional* | +0.023 ± 0.125 |
 
-### 1. Entorns conda
+Eliminar l'objecte gairebé sempre canvia la predicció, però l'atribució d'IG amb prou feines es desplaça fora de la regió de l'objecte: una dissociació entre fidelitat conductual i atribucional. Detall metodològic i discussió a la memòria (`thesis/TFG.pdf`).
 
-```bash
-# Entorn principal (SAM 2 + Replicate + mètriques)
-conda env create -f envs/environment.yml
-conda activate xai_env
+## Pipeline
 
-# Entorn LaMa (només necessari per a --inpainting lama)
-conda env create -f envs/lama_env.yml
-conda activate lama_env
-pip install scikit-learn requests tensorboard==2.11.0
-pip install albumentations==1.1.0 imgaug==0.4.0
+```
+COCO (1 cotxe, 10-30% àrea, seed=42)
+  → màscara (anotació + dilatació)
+  → IOPaint (LaMa) → parell contrafactual
+  → fine-tuning ResNet-18 binari (amb cotxe / sense cotxe)
+  → Integrated Gradients + Focus
 ```
 
-### 2. Submòdul LaMa
+El Focus es calcula sobre la regió *empírica* de diferència entre el parell (no la màscara COCO) i s'agrega només sobre els parells on canvia la predicció — són decisions metodològiques documentades als comentaris de `src/03_xai_analysis.py` i a la memòria.
+
+## Instal·lació
+
+Per fer fine-tuning i l'anàlisi XAI sobre el dataset ja generat (`02`, `03`, mètriques de qualitat), només fa falta un entorn:
 
 ```bash
-git submodule update --init --recursive
+python3 -m venv .venv && source .venv/bin/activate   # o conda create -n xai_env python=3.10
+pip install -r requirements.txt
 ```
 
-Aplicar pedaços de compatibilitat dins de `lama_env`:
+Regenerar el dataset des de zero (`01_generate_dataset.py`) també crida IOPaint com a procés extern, en un entorn a part perquè arrossega dependències pesades (gradio, diffusers) que no fan falta a la resta del codi:
 
 ```bash
-conda activate lama_env
-
-# Pedaç imgaug (incompatible amb numpy >= 1.24)
-python3 -c "
-import imgaug.imgaug as f, inspect, pathlib
-path = pathlib.Path(inspect.getfile(f))
-text = path.read_text()
-text = text.replace(
-    'NP_FLOAT_TYPES = set(np.sctypes[\"float\"])',
-    'NP_FLOAT_TYPES = set([np.float16, np.float32, np.float64])'
-)
-path.write_text(text)
-print('Pedaç imgaug aplicat correctament')
-"
-
-# Pedaç torch.load (PyTorch >= 2.6)
-sed -i '' 's/torch.load(path, map_location=map_location)/torch.load(path, map_location=map_location, weights_only=False)/' models/lama/saicinpainting/training/trainers/__init__.py
-
-# Pedaç refiner per a CPU (sense CUDA)
-sed -i '' "s/gpu_ids = \[f'cuda:{gpuid}' for gpuid in gpu_ids.replace(\" \",\"\").split(\",\") if gpuid.isdigit()\]/gpu_ids = ['cpu']/" models/lama/saicinpainting/evaluation/refinement.py
+./setup_iopaint_env.sh
+export IOPAINT_PYTHON=$(conda run -n iopaint_env which python)
 ```
 
-### 3. Checkpoint SAM 2
+(alternativament, `conda env create -f envs/iopaint_env.yml` reprodueix l'entorn exacte usat als resultats).
 
-```bash
-mkdir -p checkpoints
-curl -L -o checkpoints/sam2.1_hiera_small.pt \
-  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
-```
-
-### 4. Checkpoint LaMa (big-lama)
-
-```bash
-cd models/lama
-curl -L "https://huggingface.co/smartywu/big-lama/resolve/main/big-lama.zip" -o big-lama.zip
-unzip big-lama.zip && rm big-lama.zip
-cd ../..
-```
-
-### 5. Anotacions COCO
+### Dades externes (no incloses al repositori)
 
 ```bash
 mkdir -p data
 curl -O http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-unzip annotations_trainval2017.zip annotations/instances_val2017.json
-mv annotations/instances_val2017.json data/instances_val2017.json
-rm annotations_trainval2017.zip
+unzip annotations_trainval2017.zip annotations/instances_train2017.json
+mv annotations/instances_train2017.json data/annotations/instances_train2017.json
+rm -rf annotations_trainval2017.zip annotations
 ```
 
-## Ús
+Les imatges COCO es descarreguen automàticament (via `coco_url`) durant `01_generate_dataset.py`.
+
+## Reproducció
 
 ```bash
-conda activate xai_env
-
-# Amb LaMa local (recomanat)
-export LAMA_PYTHON=/opt/homebrew/Caskroom/miniconda/base/envs/lama_env/bin/python3
-python pipeline/pipeline.py --inpainting lama --n 15
-
-# Amb Replicate API
-export REPLICATE_API_TOKEN=el_teu_token
-python pipeline/pipeline.py --inpainting replicate --n 15
+source .venv/bin/activate
+python src/01_generate_dataset.py --ann-file data/annotations/instances_train2017.json --n 500
+python src/02_finetune_resnet18.py
+python src/03_xai_analysis.py
+python src/compute_quality_metrics.py
 ```
 
-> **Nota:** El path de `LAMA_PYTHON` pot variar segons la instal·lació de conda.  
-> Troba'l amb: `conda activate lama_env && which python3`
+## Notebook
 
-## Resultats del pilot (15 imatges)
+`notebooks/pipeline_walkthrough.ipynb` recorre el pipeline sencer sobre un únic parell (selecció → màscara → inpainting → classificació → IG → Focus). És el punt d'entrada recomanat per inspeccionar cada pas sense regenerar tot el dataset.
 
-| Backend | Parells vàlids | SSIM mig | PCP exterior |
-|---|---|---|---|
-| Replicate (bria/eraser) | 6/15 | 0.9423 | 8.80% |
-| LaMa (big-lama) | 9/15 | 0.9514 | 0.00% |
-
-LaMa preserva el fons de manera perfecta (PCP exterior = 0%), cosa essencial per generar parells contrafactuals vàlids per a l'avaluació de mètodes XAI.
+Totes les seves dependències ja són a `requirements.txt`; per obrir-lo només fa falta Jupyter (`pip install jupyter ipywidgets`) — `ipywidgets` evita un avís cosmètic de `tqdm` sobre les barres de progrés dins del notebook.
 
 ## Estructura del repositori
 
 ```
-xai-dataset/
-├── pipeline/
-│   └── pipeline.py          # Script principal
+xainpainting/
+├── requirements.txt                # entorn principal (01, 02, 03, mètriques)
+├── src/
+│   ├── 01_generate_dataset.py     # COCO → màscares → IOPaint
+│   ├── 02_finetune_resnet18.py    # fine-tuning binari
+│   ├── 03_xai_analysis.py         # Integrated Gradients + Focus
+│   └── compute_quality_metrics.py # PCP/MAPD/SSIM
+├── notebooks/
+│   └── pipeline_walkthrough.ipynb
+├── experiments/                   # exploració preliminar (vegeu experiments/README.md)
+├── thesis/
+│   └── TFG.pdf                    # memòria del TFG
 ├── envs/
-│   ├── environment.yml      # Entorn xai_env (Python 3.10)
-│   └── lama_env.yml         # Entorn lama_env (Python 3.9)
-├── models/
-│   └── lama/                # Submòdul LaMa (git submodule)
-├── checkpoints/             # Checkpoint SAM 2 (no inclòs al Git)
-├── data/                    # Imatges COCO i anotacions (no inclòs al Git)
-└── output/                  # Parells generats (no inclòs al Git)
+│   └── iopaint_env.yml            # nomes per regenerar el dataset (01)
+└── setup_iopaint_env.sh           # idem
 ```
 
-## Dependències externes (no incloses al repositori)
+`data/`, `checkpoints/` i `output*/` (imatges COCO, pesos, resultats intermedis) no es pugen al repositori — vegeu `.gitignore`.
 
-Els següents fitxers s'han de descarregar manualment (vegeu els passos anteriors):
+## Experiments preliminars
 
-| Fitxer | Mida aproximada | Font |
-|---|---|---|
-| `checkpoints/sam2.1_hiera_small.pt` | ~180 MB | Meta AI |
-| `models/lama/big-lama/` | ~200 MB | Hugging Face |
-| `data/instances_val2017.json` | ~25 MB | COCO Dataset |
-| `data/coco_images/` | Variable | COCO Dataset (descarregat automàticament) |
+`experiments/` conserva els mètodes de detecció/inpainting explorats abans d'arribar al pipeline final (SAM+SD, GroundingDINO+SAM). Necessiten el paquet `segment-anything` i el checkpoint `checkpoints/sam_vit_b_01ec64.pth` (Meta AI), que no fan falta per al pipeline principal. Detall a `experiments/README.md`.
