@@ -25,7 +25,7 @@ SEED         = 42           # seleccio reproduible
 
 IOPAINT_PYTHON = os.environ.get(  # python de l'entorn amb iopaint instal·lat
     "IOPAINT_PYTHON",
-    "/opt/homebrew/Caskroom/miniconda/base/envs/iopaint_env/bin/python")
+    "/opt/homebrew/Caskroom/miniconda/base/envs/iopaint/bin/python")
 
 
 def seleccionar_imatges(ann_file: Path, n: int) -> list[dict]:

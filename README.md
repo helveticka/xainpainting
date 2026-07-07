@@ -37,11 +37,11 @@ pip install -r requirements.txt
 Regenerar el dataset des de zero (`01_generate_dataset.py`) també crida IOPaint com a procés extern, en un entorn a part perquè arrossega dependències pesades (gradio, diffusers) que no fan falta a la resta del codi:
 
 ```bash
-./setup_iopaint_env.sh
-export IOPAINT_PYTHON=$(conda run -n iopaint_env which python)
+./envs/setup.sh
+export IOPAINT_PYTHON=$(conda run -n iopaint which python)
 ```
 
-(alternativament, `conda env create -f envs/iopaint_env.yml` reprodueix l'entorn exacte usat als resultats).
+L'script crea l'entorn a partir d'`envs/iopaint.yml`, que reprodueix les versions exactes usades als resultats.
 
 ### Dades externes (no incloses al repositori)
 
@@ -73,7 +73,7 @@ python src/compute_quality_metrics.py
 
 ```
 xainpainting/
-├── requirements.txt                # entorn principal (01, 02, 03, mètriques)
+├── requirements.txt               # entorn principal (01, 02, 03, mètriques)
 ├── src/
 │   ├── 01_generate_dataset.py     # COCO → màscares → IOPaint
 │   ├── 02_finetune_resnet18.py    # fine-tuning binari
@@ -81,16 +81,11 @@ xainpainting/
 │   └── compute_quality_metrics.py # PCP/MAPD/SSIM
 ├── notebooks/
 │   └── pipeline_walkthrough.ipynb
-├── experiments/                   # exploració preliminar (vegeu experiments/README.md)
 ├── thesis/
 │   └── TFG.pdf                    # memòria del TFG
-├── envs/
-│   └── iopaint_env.yml            # nomes per regenerar el dataset (01)
-└── setup_iopaint_env.sh           # idem
+└── envs/
+    ├── iopaint.yml                # nomes per regenerar el dataset (01)
+    └── setup.sh                   # idem
 ```
 
 `data/`, `checkpoints/` i `output*/` (imatges COCO, pesos, resultats intermedis) no es pugen al repositori — vegeu `.gitignore`.
-
-## Experiments preliminars
-
-`experiments/` conserva els mètodes de detecció/inpainting explorats abans d'arribar al pipeline final (SAM+SD, GroundingDINO+SAM). Necessiten el paquet `segment-anything` i el checkpoint `checkpoints/sam_vit_b_01ec64.pth` (Meta AI), que no fan falta per al pipeline principal. Detall a `experiments/README.md`.

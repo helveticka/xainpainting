@@ -1,4 +1,4 @@
-name: iopaint_env
+name: iopaint
 channels:
   - defaults
 dependencies:
