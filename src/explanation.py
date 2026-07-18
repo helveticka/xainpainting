@@ -1,13 +1,3 @@
-# integrated gradients sobre el classificador binari (amb cotxe=1) + focus i caiguda de P(cotxe)
-#
-# la regio de referencia del focus es la diferencia empirica de pixels entre el parell,
-# no la mascara coco: aquesta exclou el que l'inpainting ha deixat intacte i no depen de
-# cap anotacio externa al parell (marc teoric: regio "real" vs regio "prevista").
-# focus es calcula sobre rellevancia POSITIVA (arias-duart et al., 2022), i s'agrega
-# nomes sobre els parells on canvia la prediccio -- l'unic escenari on l'objecte decideix
-# la classificacio. el filtre es sobre el senyal de probabilitat, no sobre el focus,
-# per no introduir seleccio esbiaixada (xai_results.json guarda tots els parells)
-
 import argparse
 import json
 from pathlib import Path
@@ -23,7 +13,7 @@ from torchvision import models, transforms
 from torchvision.models import ResNet18_Weights
 from tqdm import tqdm
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"  # data/ es a l'arrel del repo, no dins src/
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 IG_TARGET = 1          # classe explicada: "amb cotxe"
 DIFF_TAU  = 0.05       # llindar [0,1] per a la regio de diferencia (~13/255: ignora soroll de compressio)
