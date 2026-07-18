@@ -1,6 +1,3 @@
-# PCP/MAPD/SSIM entre original i contrafactual, global i fora de la mascara
-# (exterior ha de ser ~0 si LaMa no toca res fora del vehicle)
-
 import argparse
 import json
 from pathlib import Path
@@ -11,7 +8,7 @@ from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"  # data/ es a l'arrel del repo, no dins src/
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 def carregar_parell(entry: dict):
