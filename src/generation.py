@@ -1,5 +1,3 @@
-# genera parells contrafactuals: coco (1 cotxe) -> mascara dilatada -> iopaint (lama)
-
 import argparse
 import json
 import os
@@ -15,7 +13,7 @@ from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 from tqdm import tqdm
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"  # data/ es a l'arrel del repo, no dins src/
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 N_CARS       = 1            # exactament 1 cotxe per imatge, evita ambiguitat semantica
 MIN_CAR_AREA = 0.10         # prou gran per ser rellevant
@@ -140,7 +138,6 @@ def run(ann_file: Path, n: int, output_dir: Path, device: str):
     print(f"\n{'='*50}\nDataset generat a: {output_dir}")
     print(f"  Parells vàlids: {len(valids)}  "
           f"(originals + contrafactuals = {len(valids)*2} imatges)\n{'='*50}")
-    print("Pròxim pas: fine-tuning de ResNet-18 (02_finetune_resnet.py)")
 
 
 if __name__ == "__main__":
