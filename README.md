@@ -1,5 +1,5 @@
 # XAINPAINTING
-*Fidelitat d'Integrated Gradients sobre parells contrafactuals*
+**Fidelitat d'Integrated Gradients sobre parells contrafactuals**
 
 Pipeline per generar parells d'imatges contrafactuals (amb cotxe / sense cotxe) i mesurar si les explicacions d'Integrated Gradients (IG) sobre un classificador binari són fidels a la decisió real del model.
 
