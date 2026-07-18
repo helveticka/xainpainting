@@ -1,6 +1,3 @@
-# fine-tuning resnet-18 binari (1=amb cotxe, 0=inpaintat) sobre els parells de 01_generate_dataset.py
-# divisio 80/20 per PARELLS (no per imatge) per evitar data leakage entre train i val
-
 import argparse
 import json
 import random
@@ -17,7 +14,7 @@ from torchvision import models, transforms
 from torchvision.models import ResNet18_Weights
 from tqdm import tqdm
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"  # data/ es a l'arrel del repo, no dins src/
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"  
 
 class CarDataset(Dataset):
     # cada parell aporta 2 exemples: (img_path, 1) i (inpainted_path, 0)
@@ -246,9 +243,6 @@ def run(metadata_file: Path, output_dir: Path, epochs: int, lr: float,
 
     print(f"\nModel guardat:  {millor_path}")
     print(f"Resultats a:    {output_dir}/")
-    print(f"\nPròxim pas: aplicar Integrated Gradients sobre aquest model")
-    print(f"  python 03_xai_analysis.py --model {millor_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
